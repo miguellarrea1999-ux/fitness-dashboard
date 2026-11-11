@@ -10,6 +10,7 @@ const PUBLIC_PATHS = [
   "/api/strava",
   "/api/intervals",
   "/api/garmin/wellness",
+  "/api/bitacora",       // protegida con BITACORA_TOKEN dentro de la ruta
   "/api/warm",
   "/auth/strava/callback",
   "/favicon.ico",

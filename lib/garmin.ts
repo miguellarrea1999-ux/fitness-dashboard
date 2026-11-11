@@ -1,7 +1,7 @@
 import { GarminConnect } from "garmin-connect";
 import { loadGarminTokens, saveGarminTokens } from "./garminTokens";
 import { cacheGetOrSet, cacheGetOrSetSwr } from "./kv";
-import { addDays, formatTrainingDay, pastDays, today } from "./trainingDay";
+import { addDays, formatTrainingDay, parseTrainingDay, pastDays, today } from "./trainingDay";
 
 let _client: GarminConnect | null = null;
 let _displayName: string | null = null;
@@ -57,14 +57,17 @@ export type GarminDailySummary = {
   steps: number | null;
   sleepHours: number | null;
   restingHR: number | null;
+  /** Hora local (HH:MM) a la que empezó el sueño que termina este día (convención Garmin). */
+  sleepStart?: string | null;
 };
 
 async function getGarminDailySummary(date: Date): Promise<GarminDailySummary> {
   const c = await getClient();
   const dateStr = formatTrainingDay(date);
 
+  // getSteps() de la librería devuelve los pasos desplazados un día → se usa usersummary (correcto)
   const [steps, sleep, hr] = await Promise.allSettled([
-    c.getSteps(date),
+    getGarminDailyFull(date).then((f) => f?.totalSteps ?? null),
     c.getSleepData(date),
     c.getHeartRate(date),
   ]);
@@ -87,12 +90,19 @@ async function getGarminDailySummary(date: Date): Promise<GarminDailySummary> {
       hr.status === "fulfilled" && (hr.value as { restingHeartRate?: number })?.restingHeartRate
         ? (hr.value as { restingHeartRate: number }).restingHeartRate
         : null,
+    sleepStart: (() => {
+      // sleepStartTimestampLocal: milisegundos de la hora local codificada como UTC
+      const ms = sleep.status === "fulfilled"
+        ? (sleep.value as { dailySleepDTO?: { sleepStartTimestampLocal?: number } })?.dailySleepDTO?.sleepStartTimestampLocal
+        : undefined;
+      return typeof ms === "number" ? new Date(ms).toISOString().slice(11, 16) : null;
+    })(),
   };
 }
 
 export async function getGarminWeekSummary(): Promise<GarminDailySummary[]> {
   const end = today();
-  return cacheGetOrSet(`garmin:week:${formatTrainingDay(end)}`, 30 * 60, async () => {
+  return cacheGetOrSet(`garmin:week:v3:${formatTrainingDay(end)}`, 30 * 60, async () => {
     const dates = pastDays(7, end);
     const results = await Promise.allSettled(dates.map((d) => getGarminDailySummary(d)));
     return results.map((r, i) =>
@@ -103,6 +113,7 @@ export async function getGarminWeekSummary(): Promise<GarminDailySummary[]> {
             steps: null,
             sleepHours: null,
             restingHR: null,
+            sleepStart: null,
           }
     );
   });
@@ -853,4 +864,79 @@ async function buildGarminDashboard(date: Date): Promise<GarminDashboard> {
     weekPulseOx,
     weekRollup: buildWeekRollup(weekDaily, weekSleep, weekPulseOx),
   };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Bitácora: historial completo por día (para el diario personal de Miguel).  */
+/* -------------------------------------------------------------------------- */
+
+export type BitacoraDay = {
+  date: string;
+  steps: number | null;
+  distanceKm: number | null;
+  activeKcal: number | null;
+  intensityMin: number | null;
+  restingHR: number | null;
+  stressAvg: number | null;
+  bodyBatteryMax: number | null;
+  bodyBatteryMin: number | null;
+  spo2Avg: number | null;
+  sleepHours: number | null;
+  sleepStart: string | null; // HH:MM local, inicio del sueño que termina este día
+  sleepEnd: string | null;   // HH:MM local
+  sleepScore: number | null;
+  deepMin: number | null;
+  remMin: number | null;
+  awakeMin: number | null;
+  hrv: number | null;        // media de la noche (ms)
+  hrvStatus: string | null;
+};
+
+const hhmm = (ms: unknown) => (typeof ms === "number" ? new Date(ms).toISOString().slice(11, 16) : null);
+const mins = (s: unknown) => (typeof s === "number" ? Math.round(s / 60) : null);
+
+async function getBitacoraDay(date: Date): Promise<BitacoraDay> {
+  const c = await getClient();
+  const dateStr = formatTrainingDay(date);
+  const [full, sleep, hrv] = await Promise.all([
+    getGarminDailyFull(date).catch(() => null),
+    c.getSleepData(date).catch(() => null) as Promise<unknown>,
+    getGarminHRV(date).catch(() => null),
+  ]);
+  await persist(c);
+  const s = (sleep as { dailySleepDTO?: Record<string, unknown> } | null)?.dailySleepDTO ?? {};
+  const score = (s.sleepScores as { overall?: { value?: number } } | undefined)?.overall?.value ?? null;
+  return {
+    date: dateStr,
+    steps: full?.totalSteps ?? null,
+    distanceKm: full?.totalDistanceMeters != null ? Math.round(full.totalDistanceMeters / 100) / 10 : null,
+    activeKcal: full?.activeKilocalories ?? null,
+    intensityMin: full?.intensityMinutes ?? null,
+    restingHR: full?.restingHeartRate ?? null,
+    stressAvg: full?.averageStressLevel != null && full.averageStressLevel >= 0 ? full.averageStressLevel : null,
+    bodyBatteryMax: full?.bodyBatteryHighestValue ?? null,
+    bodyBatteryMin: full?.bodyBatteryLowestValue ?? null,
+    spo2Avg: full?.averageSpo2 ?? null,
+    sleepHours: typeof s.sleepTimeSeconds === "number" ? Math.round((s.sleepTimeSeconds / 3600) * 10) / 10 : null,
+    sleepStart: hhmm(s.sleepStartTimestampLocal),
+    sleepEnd: hhmm(s.sleepEndTimestampLocal),
+    sleepScore: score,
+    deepMin: mins(s.deepSleepSeconds),
+    remMin: mins(s.remSleepSeconds),
+    awakeMin: mins(s.awakeSleepSeconds),
+    hrv: hrv?.lastNightAvg ?? null,
+    hrvStatus: hrv?.status ?? null,
+  };
+}
+
+/** Rango [from, to] (como mucho 14 días por llamada), de 3 en 3 para no saturar a Garmin. */
+export async function getBitacoraRange(from: string, to: string): Promise<BitacoraDay[]> {
+  const out: BitacoraDay[] = [];
+  const dates: Date[] = [];
+  for (let d = parseTrainingDay(from); formatTrainingDay(d) <= to && dates.length < 14; d = new Date(d.getTime() + 86400000)) dates.push(d);
+  for (let i = 0; i < dates.length; i += 3) {
+    const chunk = await Promise.all(dates.slice(i, i + 3).map((d) => getBitacoraDay(d)));
+    out.push(...chunk);
+  }
+  return out;
 }
